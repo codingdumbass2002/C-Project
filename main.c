@@ -2,11 +2,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
-#include <stdlib.h>
+#include <sys/random.h>
 
 
 uint8_t hd_mem[4194304];
 uint8_t ra_mem[65536];
+
+ uint32_t fifo_queue[1024];
+ uint32_t fifo_front = 0;
+ uint32_t fifo_rear = 0;
 
 
 struct seitentabellen_zeile {
@@ -24,15 +28,12 @@ uint16_t get_seiten_nr(uint32_t virt_address) {
 
 uint16_t virt_2_ram_address(uint32_t virt_address) {
     // Extract the offset (lower 12 bits) from the virtual address
-    uint16_t offset = virt_address << 20;
+    uint16_t offset = virt_address & 0xFFF;
 
     // Extract the upper 20 bits from the virtual address
-    uint32_t upper_bits = virt_address >> 12;
+    uint32_t page_num = get_seiten_nr(virt_address);
 
-
-    uint8_t compressed_bits = (upper_bits ^ (upper_bits >> 16)) & 0xF;
-
-    uint16_t physical_address = (offset << 4) | compressed_bits;
+    uint16_t physical_address = seitentabelle[page_num].page_frame << 12 | offset;
 
     return physical_address;
 }
@@ -70,36 +71,59 @@ int8_t write_page_to_hd(uint32_t seitennummer, uint32_t virt_address) { // alte 
 }
 
 uint16_t swap_page(uint32_t virt_address) {
-    uint16_t page_number = get_seiten_nr(virt_address);
-    uint16_t swapped_page_frame = seitentabelle[page_number].page_frame;
 
-    if (seitentabelle[page_number].dirty_bit) {
-        write_page_to_hd(page_number, virt_address);
+    uint16_t swapped_page_frame = seitentabelle[fifo_front].page_frame;
+
+    if (seitentabelle[fifo_front].dirty_bit) {
+        write_page_to_hd(fifo_front, virt_address); // Write page to HD if dirty
     }
 
-    get_page_from_hd(virt_address);
+    // Reset page attributes for swapping
+    seitentabelle[fifo_front].page_frame = -1;
+    seitentabelle[fifo_front].present_bit = 0;
 
-    seitentabelle[page_number].present_bit = 1;
-    seitentabelle[page_number].dirty_bit = 0;
-    seitentabelle[page_number].page_frame = virt_2_ram_address(virt_address);
+    // Update the front of the queue (FIFO replacement)
+    fifo_front = (fifo_front + 1) % 1024;
 
-    return swapped_page_frame;
+    return swapped_page_frame; // Return the physical address of swapped-out page
 }
 
 int8_t get_page_from_hd(uint32_t virt_address) {
-    /**
-       * Lädt eine Seite von der Festplatte und speichert diese Daten im ra_mem (Arbeitsspeicher).
-       * Erstellt einen Seitentabelleneintrag.
-       * Wenn der Arbeitsspeicher voll ist, muss eine Seite ausgetauscht werden.
-       */
+    uint32_t seitennummer = get_seiten_nr(virt_address);
+    int8_t page_loaded = 0;
 
-    //TODO
+    if (is_mem_full()) {
+        seitentabelle[seitennummer].page_frame = swap_page(virt_address);
+        page_loaded = 1;
+    } else {
+        // Find the first free page frame
+        for (uint32_t i = 0; i < 1024; i++) {
+            if (seitentabelle[i].page_frame == -1) {
+                seitentabelle[seitennummer].page_frame = i;
+                page_loaded = 1;
+                break;
+            }
+        }
+    }
+
+    if (page_loaded) {
+        // Load the page from the hard disk to RAM
+        for (int offset = 0; offset < 4096; offset++) {
+            ra_mem[offset] = hd_mem[virt_address + offset];
+        }
+
+        // Update the page table entry to mark the page as present in RAM
+        seitentabelle[seitennummer].present_bit = 1;
+        return 1; // Successfully loaded page from hard disk
+    }
+
+    return 0;
 }
 
 uint8_t get_data(uint32_t virt_address) {
     uint16_t physical_address = virt_2_ram_address(virt_address);
 
-    if (!seitentabelle[get_seiten_nr(virt_address)].present_bit) {
+    if (!check_present(virt_address)) {
 
         get_page_from_hd(virt_address);
     }
@@ -111,7 +135,7 @@ uint8_t get_data(uint32_t virt_address) {
 void set_data(uint32_t virt_address, uint8_t value) {
     uint16_t physical_address = virt_2_ram_address(virt_address); // Get the physical address in RAM
 
-    if (!seitentabelle[get_seiten_nr(virt_address)].present_bit) {
+    if (!check_present(virt_address)) {
         get_page_from_hd(virt_address);
     }
 
