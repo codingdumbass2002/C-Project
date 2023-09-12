@@ -2,16 +2,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
-
-
+#include <sys/random.h>
 
 
 uint8_t hd_mem[4194304];
 uint8_t ra_mem[65536];
 
- uint32_t fifo_queue[1024];
- uint32_t fifo_front = 0;
- uint32_t fifo_rear = 0;
+// This COUNT will be used later
+int COUNT = 0;
+
+
 
 
 struct seitentabellen_zeile {
@@ -20,125 +20,165 @@ struct seitentabellen_zeile {
     int8_t page_frame;
 }seitentabelle[1024]; // 4194304 >> 12 = 1024
 
+
+
 uint16_t get_seiten_nr(uint32_t virt_address) {
 
     return virt_address >> 12;
 }
 
 uint16_t virt_2_ram_address(uint32_t virt_address) {
-    // We extract the lower 12 bits for the Offset
+    // Extract the lower 12 bits (offset) from the virtual address
     uint16_t offset = virt_address & 0xFFF;
 
-    //We extract the upper 20 bits from the virtual address
+    // Calculate the page number by shifting the upper 20 bits of the virtual address
     uint32_t page_num = get_seiten_nr(virt_address);
 
-    uint16_t physical_address = seitentabelle[page_num].page_frame << 12 | offset;
+    // Calculate the physical address by combining the page frame (shifted left by 12 bits)
+    // with the offset using bitwise OR
+    uint16_t physical_address = (seitentabelle[page_num].page_frame << 12) + offset;
 
+    // Return the resulting physical address
     return physical_address;
 }
 
 int8_t check_present(uint32_t virt_address) {
-
+    // If its present it will return 1 if not it will return 0
     return seitentabelle[get_seiten_nr(virt_address)].present_bit;
 }
 
+
+
 int8_t is_mem_full() {
-    // We can use a Brute force Method for simplicity (not Optimal)
+    // We can use a Brute force Method for simplicity (not Optimal), by just iterating through every page to check if they are all occupied
     for (int i = 0; i < 1024; i++) {
         if (!seitentabelle[i].present_bit) {
+
+            // If one of the pages is not full it will return a 0 which means RAM is still not full
             return 0;
         }
     }
     return 1;
 }
 
-int8_t write_page_to_hd(uint32_t seitennummer, uint32_t virt_address) { // alte addresse! nicht die neue!
-    // We need to check if its dirty in that case we write back
-    if (seitentabelle[seitennummer].dirty_bit) {
-        for (int offset = 0; offset < 4096; offset++) {
-            hd_mem[seitennummer * 4096 + offset] = ra_mem[offset];
-        }
-
-        // We Mark it now as not dirty
-        seitentabelle[seitennummer].dirty_bit = 0;
-
-        return 1;
+int8_t write_page_to_hd(uint32_t seitennummer, uint32_t virt_address) {
+    // This for loop will basically write the page from RAM to its designated place in Hard Drive
+    // As we know the Offset will stay the same in both spaces so we need to keep track of it
+    for (int offset = 0; offset < 4096; offset++){
+        hd_mem[get_seiten_nr(virt_address) * 4096 + offset] = ra_mem[seitennummer * 4096 + offset];
     }
-
-    return 0; // If its not dirty then we dont need to write back
+    return 1;
 }
 
 uint16_t swap_page(uint32_t virt_address) {
+    // We first need to extract the Page Number of the Physical Adress by doing so:
+    uint32_t page_number = virt_2_ram_address(virt_address) >> 12;
 
-    uint16_t swapped_page_frame = seitentabelle[fifo_front].page_frame;
+    // We now use the write page to hd function to write the page on HD
+    write_page_to_hd(page_number, virt_address);
 
-    if (seitentabelle[fifo_front].dirty_bit) {
-        write_page_to_hd(fifo_front, virt_address); // Write page to HD if dirty
+    // After that we switch it to "not dirty" since we just switched it which makes it clean
+    seitentabelle[get_seiten_nr(virt_address)].dirty_bit = 0;
+
+    return 1;
+}
+//I used a not so optimal strategy for the sake of simplicity, this is in no way optimal!!
+int8_t get_page_from_hd(uint32_t virt_address) {
+    // This part of the function will be active when RAM is full:
+
+    // Check if RAM is full
+    if (is_mem_full()) {
+        // RAM is full, so we'll replace page 1
+        // Mark page 1 as not present in RAM
+        seitentabelle[1].present_bit = 0;
+
+        // Swap out page 1 from RAM to the hard disk
+        swap_page(1 * 4096);
+
+        // Copy the page from the hard disk to RAM
+        for (int offset = 0; offset < 4096; offset++) {
+            // Copy each byte of the page from hard disk to RAM
+            ra_mem[1 * 4096 + offset] = hd_mem[get_seiten_nr(virt_address) * 4096 + offset];
+        }
+
+        // Mark the page as not dirty (unchanged)
+        seitentabelle[get_seiten_nr(virt_address)].dirty_bit = 0;
+        // Update the page table entry for the new page in RAM
+        seitentabelle[get_seiten_nr(virt_address)].page_frame = 1;
+        // Mark the page as present in RAM
+        seitentabelle[get_seiten_nr(virt_address)].present_bit = 1;
+
+        // Return 1 to indicate success, and also to leave the function
+        return 1;
     }
 
-    // We reset the attributes
-    seitentabelle[fifo_front].page_frame = -1;
-    seitentabelle[fifo_front].present_bit = 0;
+    //-------------------------------------------------------------------------------------------------------
 
-    //We update the front of the queue (FIFO replacement)
-    fifo_front = (fifo_front + 1) % 1024;
+    // In the case that its not full, we need to fill it up using the BB_COUNTER global variable
+    else {
+        for (int i = 0; i < 1024; i++) {
+            // Check if the page is in RAM (present_bit == 1) and has the same page_frame as 'COUNT'
+            if (seitentabelle[i].page_frame == COUNT && seitentabelle[i].present_bit == 1) {
 
-    return swapped_page_frame; // Return the physical address of swapped-out page
-}
+                // Mark the page as not present in RAM
+                seitentabelle[i].present_bit = 0;
 
-int8_t get_page_from_hd(uint32_t virt_address) {
-    uint32_t seitennummer = get_seiten_nr(virt_address);
-    int8_t page_loaded = 0;
-
-    if (is_mem_full()) {
-        seitentabelle[seitennummer].page_frame = swap_page(virt_address);
-        page_loaded = 1;
-    } else {
-        // We find the first free page frame
-        for (uint32_t i = 0; i < 1024; i++) {
-            if (seitentabelle[i].page_frame == -1) {
-                seitentabelle[seitennummer].page_frame = i;
-                page_loaded = 1;
+                // Swap out the page from RAM to the hard disk, then break since we found the Page
+                swap_page(i * 4096);
                 break;
+
             }
         }
     }
 
-    if (page_loaded) {
-        // Now this loads the page from the hard disk to RAM
-        for (int offset = 0; offset < 4096; offset++) {
-            ra_mem[offset] = hd_mem[virt_address + offset];
-        }
-
-        // If page is loaded then we need to update the page table entry to mark the page as present in RAM
-        seitentabelle[seitennummer].present_bit = 1;
-        return 1; // Successfully loaded page from hard disk
+    // Copy the page from the hard disk to RAM
+    for (int offset = 0; offset < 4096; offset++) {
+        // Copy each byte of the page from hard disk to RAM
+        ra_mem[COUNT * 4096 + offset] = hd_mem[get_seiten_nr(virt_address) * 4096 + offset];
     }
 
-    return 0;
+    // Mark the page as not dirty (unchanged)
+    seitentabelle[get_seiten_nr(virt_address)].dirty_bit = 0;
+    // Update the page table entry for the new page in RAM
+    seitentabelle[get_seiten_nr(virt_address)].page_frame = COUNT;
+    // Mark the page as present in RAM
+    seitentabelle[get_seiten_nr(virt_address)].present_bit = 1;
+
+    // Cycle to the next Page
+    COUNT++;
+
+    // we only have 16 Page frames so we dont want to go overboard
+    if (COUNT == 16) {
+        COUNT--;
+    }
+
+    // Return 1 to indicate success
+    return 1;
 }
 
+
+
+
 uint8_t get_data(uint32_t virt_address) {
-    uint16_t physical_address = virt_2_ram_address(virt_address);
-
+    // in the case that the requested data is not present in RAM we need to fetch it first from the hard drive
     if (!check_present(virt_address)) {
-
         get_page_from_hd(virt_address);
     }
 
-
-    return ra_mem[physical_address];
+    // Return the requested Data
+    return ra_mem[virt_2_ram_address(virt_address)];
 }
 
 void set_data(uint32_t virt_address, uint8_t value) {
-    uint16_t physical_address = virt_2_ram_address(virt_address); // Get the physical address in RAM
 
+    // Same as the get_data function, we need to verify first that the data is present, if not we we get it from hard drive
     if (!check_present(virt_address)) {
         get_page_from_hd(virt_address);
     }
+    // When it is present all we have to do is set the new value to it
+    ra_mem[virt_2_ram_address(virt_address)] = value;
 
-    ra_mem[physical_address] = value;
-
+    // Ofcourse when we change something, in RAM, that means its now dirty therefore we mark it as dirty
     seitentabelle[get_seiten_nr(virt_address)].dirty_bit = 1;
 
 }
@@ -146,7 +186,7 @@ void set_data(uint32_t virt_address, uint8_t value) {
 
 int main(void) {
     puts("test driver_");
-    uint8_t hd_mem_expected[4194304];
+    static uint8_t hd_mem_expected[4194304];
     srand(1);
     fflush(stdout);
     for(int i = 0; i < 4194304; i++) {
